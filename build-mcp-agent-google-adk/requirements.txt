@@ -3,3 +3,4 @@ python-dotenv
 mcp
 pytrends
 pandas
+litellm

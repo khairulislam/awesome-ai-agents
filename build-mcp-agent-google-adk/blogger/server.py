@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Minimal MCP server exposing a single tool: `trends`
 
@@ -10,18 +10,12 @@ Fast & demo-friendly:
 - No prints to stdout before handshake (stderr only for logs)
 """
 
-import asyncio, json, os, sys
+import os, sys
 from typing import Dict, List, Optional
 
-# MCP (low-level stdio)
-from mcp import types as mcp_types
-from mcp.server.lowlevel import Server, NotificationOptions
-from mcp.server.models import InitializationOptions
-import mcp.server.stdio
+from mcp.server.mcpserver import MCPServer
 
-# ADK FunctionTool wrapper + schema conversion
-from google.adk.tools.function_tool import FunctionTool
-from google.adk.tools.mcp_tool.conversion_utils import adk_to_mcp_tool_type
+mcp = MCPServer("adk-trends-mcp")
 
 def _log(msg: str):
    print(f"[trends] {msg}", file=sys.stderr)
@@ -45,6 +39,7 @@ def _pn_for_daily(geo: Optional[str]) -> str:
    }
    return m.get((geo or "US").upper(), "united_states")
 
+@mcp.tool()
 def trends(
    keyword: str,
    geo: Optional[str] = "US",              # ISO-2 ("US"), "" for worldwide
@@ -187,46 +182,6 @@ def trends(
        _log(f"fatal error: {e}")
        return {"status": "error", "message": f"trends failed: {e}"}
 
-# Wrap as ADK FunctionTool
-trends_tool = FunctionTool(trends)
-
-# MCP app
-app = Server("adk-trends-mcp")
-
-@app.list_tools()
-async def list_tools() -> list[mcp_types.Tool]:
-   return [adk_to_mcp_tool_type(trends_tool)]
-
-@app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[mcp_types.Content]:
-   if name != trends_tool.name:
-       err = {"error": f"unknown tool '{name}'"}
-       return [mcp_types.TextContent(type="text", text=json.dumps(err))]
-   try:
-       result = await trends_tool.run_async(args=arguments, tool_context=None)
-       return [mcp_types.TextContent(type="text", text=json.dumps(result, indent=2))]
-   except Exception as e:
-       _log(f"call_tool error: {e}")
-       err = {"error": f"Execution failed: {e}"}
-       return [mcp_types.TextContent(type="text", text=json.dumps(err))]
-
-# stdio runner
-async def run_stdio():
-   async with mcp.server.stdio.stdio_server() as (r, w):
-       await app.run(
-           r, w,
-           InitializationOptions(
-               server_name=app.name,
-               server_version="0.1.2",
-               capabilities=app.get_capabilities(
-                   notification_options=NotificationOptions(),
-                   experimental_capabilities={},
-               ),
-           ),
-       )
 
 if __name__ == "__main__":
-   try:
-       asyncio.run(run_stdio())
-   except KeyboardInterrupt:
-       pass
+   mcp.run()  # stdio

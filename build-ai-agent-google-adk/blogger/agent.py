@@ -1,112 +1,148 @@
-import os
-import sys
-from pathlib import Path
-import datetime
+﻿import os
 
 from dotenv import load_dotenv
-from google.adk.agents import Agent, LoopAgent
-from google.adk.tools import agent_tool
+from google.adk import Agent, Context, Event, Workflow
+from google.adk.models.lite_llm import LiteLlm
+from google.adk.workflow import DEFAULT_ROUTE, RetryConfig
+from pydantic import BaseModel, Field, ValidationError
 
 # ── env/config ───────────────────────────────────────────────────────────────
 load_dotenv()
 
-MODEL = os.getenv("MODEL", "gemini-flash-latest")
+# OpenRouter via LiteLLM: a `provider/model` id (e.g. `deepseek/deepseek-v4-flash`)
+# is routed through OpenRouter using OPENROUTER_API_KEY from .env. Names without a
+# slash (e.g. `gemini-flash-latest`) are passed to ADK as native Gemini models.
+_name = os.getenv("MODEL", "gemini-flash-latest").strip("\"'")
+if "/" in _name:
+   # Reasoning models can spend most of their time "thinking" (minutes for a blog post);
+   # set REASONING_EFFORT=low|medium|high in .env if you want it back.
+   MODEL = LiteLlm(
+       model=_name if _name.startswith("openrouter/") else f"openrouter/{_name}",
+       reasoning_effort=os.getenv("REASONING_EFFORT", "none"),
+   )
+else:
+   MODEL = _name
 
-# ── Sub-Agent: Planner ───────────────────────────────────────────────────────
+MAX_ATTEMPTS = 3
+# Malformed JSON (doesn't fit the schema at all) is retried by ADK itself.
+RETRY = RetryConfig(max_attempts=MAX_ATTEMPTS, initial_delay=0, exceptions=[ValidationError])
+
+
+# ── Schemas ──────────────────────────────────────────────────────────────────
+class Section(BaseModel):
+   heading: str
+   bullets: list[str] = Field(min_length=2, max_length=3)
+
+
+class Outline(BaseModel):
+   title: str
+   intro: str
+   sections: list[Section]
+   conclusion: str
+
+
+class BlogPost(BaseModel):
+   markdown: str  # the full article, starting with the H1 title
+   alternate_titles: list[str]
+   tweet_hooks: list[str]
+
+
+# ── Agents ───────────────────────────────────────────────────────────────────
 blog_planner = Agent(
    name="BlogPlanner",
    model=MODEL,
-   description="Creates a practical, skimmable outline in Markdown.",
+   description="Creates a practical, skimmable outline.",
    instruction="""
-You are a technical content strategist. Produce a clear Markdown outline with:
-- Title
-- Short intro
-- 4–6 main sections (each with 2–3 bullets)
-- Conclusion
-
-If `codebase_context` exists in state, weave in specific sections/snippets.
-Return only the outline in Markdown.
+You are a technical content strategist. Plan a blog post on the given topic:
+a title, a short intro, 4-6 sections with 2-3 bullets each, and a conclusion.
+If you are given problems with a previous outline, fix them.
 """,
-   output_key="blog_outline",
+   output_schema=Outline,
+   retry_config=RETRY,
 )
 
-class OutlineValidationChecker(Agent):
-   def __init__(self):
-       super().__init__(
-           name="OutlineValidationChecker",
-           model=MODEL,
-           description="Validates that the outline is usable.",
-           instruction="""
-Check the outline in state `blog_outline`. If it has a title, intro, 4–6 sections, and a conclusion, respond exactly "ok".
-Otherwise respond exactly "retry" and list missing pieces.
-""",
-           output_key="validation_result",
-       )
-
-robust_blog_planner = LoopAgent(
-   name="RobustBlogPlanner",
-   description="Retries planning if validation fails.",
-   sub_agents=[blog_planner, OutlineValidationChecker()],
-   max_iterations=3,
-)
-
-# ── Sub-Agent: Writer ────────────────────────────────────────────────────────
 blog_writer = Agent(
    name="BlogWriter",
    model=MODEL,
-   description="Writes a technical blog post from the outline.",
+   description="Writes a technical blog post from an outline.",
    instruction="""
-Write a complete Markdown article from the outline in `blog_outline`.
+Write a complete Markdown article that follows the outline you are given.
 
-Guidelines:
 - Audience: software engineers; skip basics and focus on practical insight.
 - Explain both the 'how' and 'why'.
 - Include concise code snippets when helpful.
-- Follow the outline’s structure (H2/H3).
-- Output only the final article in Markdown (no fence around the whole post).
+- Use an H1 title, an H2 per outline section, and end with a conclusion.
+- Give exactly 3 alternate titles and 2 tweet-length hooks (under 250 characters each)
+  only in their own fields. Never put them, or sections for them, inside the markdown.
+If you are given problems with a previous draft, fix them.
 """,
-   output_key="blog_post",
+   output_schema=BlogPost,
+   retry_config=RETRY,
 )
 
-class BlogPostValidationChecker(Agent):
-   def __init__(self):
-       super().__init__(
-           name="BlogPostValidationChecker",
-           model=MODEL,
-           description="Validates the final post.",
-           instruction="""
-Check `blog_post` for: intro, clear sections matching the outline, conclusion, and technical clarity.
-If passes, respond "ok". Else respond "retry" with the specific fixes.
-""",
-           output_key="validation_result",
-       )
 
-robust_blog_writer = LoopAgent(
-   name="RobustBlogWriter",
-   description="Retries writing if validation fails.",
-   sub_agents=[blog_writer, BlogPostValidationChecker()],
-   max_iterations=3,
-)
+# ── Review nodes: check the output, loop back with feedback, or move on ──────
+def _retry_prompt(request: str, problems: list[str], previous: str) -> str:
+   fixes = "\n".join(f"- {p}" for p in problems)
+   return f"{request}\n\nProblems with the previous attempt:\n{fixes}\n\nPrevious attempt:\n{previous}"
 
-# Expose planner/writer as tools so the root agent can call them explicitly
-planner_tool = agent_tool.AgentTool(agent=robust_blog_planner)
-writer_tool  = agent_tool.AgentTool(agent=robust_blog_writer)
 
-# ── Root Agent: Plan → Write ────────────────────────────────────────────────
-root_agent = Agent(
-   name="Blogger",
-   model=MODEL,
-   description="Minimal multi-agent blogger that plans and writes.",
-   instruction=f"""
-If the user gives a topic:
-1) Call the planner tool to generate the outline.
-2) Call the writer tool to produce the full draft.
-3) End with 3 alternate titles and 2 tweet-length hooks.
+def remember_topic(node_input: str):
+   return Event(output=node_input, state={"brief": node_input})
 
-Date: {datetime.datetime.now().strftime("%Y-%m-%d")}
-""",
-   tools=[
-       planner_tool, # calls RobustBlogPlanner
-       writer_tool,  # calls RobustBlogWriter
+
+def review_outline(ctx: Context, node_input: Outline):
+   problems = []
+   if not 4 <= len(node_input.sections) <= 6:
+       problems.append(f"has {len(node_input.sections)} sections; needs 4-6")
+
+   attempts = ctx.state.get("outline_attempts", 0) + 1
+   outline = node_input.model_dump_json()
+   if problems and attempts < MAX_ATTEMPTS:
+       return Event(route="retry", output=_retry_prompt(ctx.state["brief"], problems, outline), state={"outline_attempts": attempts})
+   return Event(output=f"Outline:\n{outline}", state={"outline": outline})
+
+
+def review_post(ctx: Context, node_input: BlogPost):
+   md = node_input.markdown
+   problems = []
+   if not md.lstrip().startswith("# "):
+       problems.append("must start with an H1 title")
+   if md.count("\n## ") < 4:
+       problems.append("needs at least 4 H2 sections")
+   if "conclusion" not in md.lower():
+       problems.append("needs a conclusion")
+   if len(md.split()) < 400:
+       problems.append("is too short (under 400 words)")
+   if len(node_input.alternate_titles) != 3:
+       problems.append("needs exactly 3 alternate titles")
+   if len(node_input.tweet_hooks) != 2:
+       problems.append("needs exactly 2 tweet hooks")
+   if any(len(h) > 250 for h in node_input.tweet_hooks):
+       problems.append("tweet hooks must be under 250 characters")
+   if "\n## alternate titles" in md.lower() or "\n## tweet hooks" in md.lower():
+       problems.append("markdown must not contain alternate titles or tweet hooks; keep them in their own fields")
+
+   attempts = ctx.state.get("post_attempts", 0) + 1
+   if problems and attempts < MAX_ATTEMPTS:
+       request = f"Outline:\n{ctx.state['outline']}"
+       return Event(route="retry", output=_retry_prompt(request, problems, md), state={"post_attempts": attempts})
+   return Event(output=node_input)
+
+
+def format_post(node_input: BlogPost):
+   titles = "\n".join(f"- {t}" for t in node_input.alternate_titles)
+   hooks = "\n".join(f"- {h}" for h in node_input.tweet_hooks)
+   return f"{node_input.markdown}\n\n---\n**Alternate titles**\n{titles}\n\n**Hooks**\n{hooks}"
+
+
+# ── Graph: plan ⇄ review → write ⇄ review → format ───────────────────────────
+root_agent = Workflow(
+   name="root_agent",
+   edges=[
+       ("START", remember_topic, blog_planner, review_outline),
+       (review_outline, {"retry": blog_planner, DEFAULT_ROUTE: blog_writer}),
+       (blog_writer, review_post),
+       (review_post, {"retry": blog_writer, DEFAULT_ROUTE: format_post}),
    ],
 )
